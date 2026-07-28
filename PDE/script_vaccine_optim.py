@@ -180,14 +180,22 @@ def compute_least_action(sol, fp_ctx, *, baseline=True, verbose=False):
 
 
 def compute_action_and_gradients(
-    C_inj, t_inj, target_hf, tau=20.0, T=140.0, basal_C=1e-12, epsilon=1
+    C_inj,
+    t_inj,
+    target_hf,
+    tau=20.0,
+    T=140.0,
+    basal_C=1e-12,
+    epsilon=1,
+    alpha_extinction=1000.0,
 ):
     """
     Computes the least action S and its finite difference gradients with respect to
-    vaccine doses (C_inj) and injection times (t_inj).
+    vaccine doses (C_inj) and injection times (t_inj). Includes a penalty
+    for intermediate population extinction.
 
     Returns:
-        action (float): The least action S.
+        action (float): The least action S including extinction penalty.
         grad_C_inj (np.ndarray): Finite difference gradient of S with respect to doses.
         grad_t_inj (np.ndarray): Finite difference gradient of S with respect to injection times.
     """
@@ -212,7 +220,25 @@ def compute_action_and_gradients(
         sol = solve_optimal_trajectory([target_hf], fp_ctx_safe)
         action_val, _ = compute_least_action(sol, fp_ctx_safe, verbose=False)
 
-        return action_val
+        # ---------------- Extinction Penalty Calculation ----------------
+        axes = fp_ctx_safe["axes"]
+        d_h = axes[0][1] - axes[0][0]
+        dH = d_h ** len(axes)
+
+        penalty = 0.0
+        # Iterate over population densities at each time step
+        for rho in fp_ctx_safe["rho_t"]:
+            N_t = np.sum(rho) * dH
+            # Penalize if population drops below the single-cell threshold
+            Nlim = 1
+            if N_t < Nlim:
+                N_t = max(N_t, 1e-6)  # Avoid division by zero
+                penalty += ((Nlim / N_t) - 1) ** 2
+        if penalty > 0:
+            print(f"Extinction penalty applied: {penalty:.6e}")
+        # ----------------------------------------------------------------
+
+        return action_val + alpha_extinction * penalty
 
     # 1. Compute Base Action
     base_action = get_action_for_params(C_inj, t_inj)
@@ -252,6 +278,8 @@ def run_optimization_loop(
     tau=20.0,
     T=140.0,
     basal_C=1e-12,
+    alpha_extinction=1000.0,
+    clipbound=1,
 ):
     """
     Optimizes vaccine doses (C_inj) and injection times (t_inj) using gradient descent,
@@ -274,7 +302,14 @@ def run_optimization_loop(
 
         # 1. Compute action and gradients using the encapsulated function
         action, grad_C_inj, grad_t_inj = compute_action_and_gradients(
-            C_inj, t_inj, target_hf, tau=tau, T=T, basal_C=basal_C
+            C_inj,
+            t_inj,
+            target_hf,
+            tau=tau,
+            T=T,
+            basal_C=basal_C,
+            epsilon=1,
+            alpha_extinction=alpha_extinction,
         )
 
         # Store action and copies of current parameters
@@ -285,8 +320,10 @@ def run_optimization_loop(
         print(f"Gradient w.r.t t_inj: {grad_t_inj}")
 
         # 2. Safeguards: Clip gradients to prevent massive updates and stiffness
-        # grad_C_inj_clipped = np.clip(grad_C_inj, -1.0, 1.0)
-        # grad_t_inj_clipped = np.clip(grad_t_inj, -1.0, 1.0)
+        # max of init c_inj
+        max_cinj = np.max(C_inj)
+        grad_C_inj = np.clip(grad_C_inj, -max_cinj * clipbound, max_cinj * clipbound)
+        grad_t_inj = np.clip(grad_t_inj, -5.0, 5.0)
 
         # 3. Apply parameter updates
         C_inj -= lr_C * grad_C_inj
@@ -297,7 +334,7 @@ def run_optimization_loop(
         t_inj[0] = t_inj_init[0]
 
         # Impose physical boundaries (safely above 0 to avoid 1/C explosions)
-        C_inj = np.maximum(C_inj, 1e-3)
+        C_inj = np.maximum(C_inj, 1e-12)
         t_inj = np.clip(t_inj, 0.0, T)
 
     print("\n" + "=" * 40)
@@ -317,14 +354,14 @@ if __name__ == "__main__":
         "--C_inj_init",
         type=float,
         nargs="+",
-        default=[91.24023, 44.56984],
+        default=[951],
         help="Initial guesses for doses (space-separated values).",
     )
     parser.add_argument(
         "--t_inj_init",
         type=float,
         nargs="+",
-        default=[0.0, 76.80806],
+        default=[0.0],
         help="Initial guesses for injection times (space-separated values).",
     )
     parser.add_argument(
@@ -338,14 +375,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_iterations",
         type=int,
-        default=20,
+        default=30,
         help="Number of optimization iterations.",
     )
     parser.add_argument(
-        "--lr_C", type=float, default=20.0, help="Learning rate for doses."
+        "--lr_C", type=float, default=1.0, help="Learning rate for doses."
     )
     parser.add_argument(
         "--lr_t", type=float, default=1.0, help="Learning rate for injection times."
+    )
+
+    parser.add_argument(
+        "--alpha_extinction",
+        type=float,
+        default=10,
+        help="Penalty weight to apply when population density falls below 1.0.",
+    )
+
+    parser.add_argument(
+        "--clipbound",
+        type=float,
+        default=1,
+        help="Bound on gradient values.",
     )
 
     # add dossier
@@ -361,6 +412,7 @@ if __name__ == "__main__":
     C_inj_initial = np.array(args.C_inj_init)
     t_inj_initial = np.array(args.t_inj_init)
     target_hf = args.target_hf
+    clipbound = args.clipbound
     n_injections = len(C_inj_initial)
 
     # Ensure lengths of initial arrays match
@@ -376,6 +428,8 @@ if __name__ == "__main__":
     print(f"  num_iterations: {args.num_iterations}")
     print(f"  lr_C: {args.lr_C}")
     print(f"  lr_t: {args.lr_t}")
+    print(f"  alpha_extinction: {args.alpha_extinction}")
+    print(f"  clipbound: {clipbound}")
     print("-" * 40)
 
     # Call the optimization loop
@@ -388,6 +442,8 @@ if __name__ == "__main__":
         lr_t=args.lr_t,
         tau=args.tau,
         T=140.0,
+        alpha_extinction=args.alpha_extinction,
+        clipbound=clipbound,
     )
 
     print("Optimized Doses:", optimized_C)
